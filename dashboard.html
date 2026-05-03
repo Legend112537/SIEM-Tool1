@@ -1,0 +1,607 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0"/>
+  <title>SOC Threat Intelligence Dashboard</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/Chart.js/4.4.1/chart.umd.min.js"></script>
+  <style>
+    :root {
+      --bg: #0a0e1a;
+      --surface: #111827;
+      --surface2: #1a2235;
+      --border: #1e2d4a;
+      --accent: #00d4ff;
+      --accent2: #7c3aed;
+      --danger: #ef4444;
+      --warning: #f59e0b;
+      --success: #10b981;
+      --text: #e2e8f0;
+      --muted: #64748b;
+      --font: 'Courier New', monospace;
+    }
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body {
+      background: var(--bg);
+      color: var(--text);
+      font-family: var(--font);
+      font-size: 13px;
+      min-height: 100vh;
+    }
+    /* HEADER */
+    .header {
+      background: var(--surface);
+      border-bottom: 1px solid var(--border);
+      padding: 14px 24px;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      position: sticky;
+      top: 0;
+      z-index: 100;
+    }
+    .logo { display: flex; align-items: center; gap: 10px; }
+    .logo-icon {
+      width: 32px; height: 32px;
+      background: linear-gradient(135deg, var(--accent), var(--accent2));
+      border-radius: 6px;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 16px;
+    }
+    .logo-text { font-size: 15px; font-weight: 700; letter-spacing: 2px; color: var(--accent); }
+    .logo-sub { font-size: 10px; color: var(--muted); letter-spacing: 1px; }
+    .header-right { display: flex; align-items: center; gap: 16px; }
+    .live-badge {
+      display: flex; align-items: center; gap: 6px;
+      background: rgba(16,185,129,0.1);
+      border: 1px solid rgba(16,185,129,0.3);
+      padding: 4px 10px; border-radius: 4px;
+      color: var(--success); font-size: 11px;
+    }
+    .live-dot {
+      width: 7px; height: 7px;
+      background: var(--success); border-radius: 50%;
+      animation: pulse 1.5s infinite;
+    }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:0.3} }
+    .time { color: var(--muted); font-size: 11px; }
+    /* LAYOUT */
+    .main { display: grid; grid-template-columns: 220px 1fr; min-height: calc(100vh - 57px); }
+    /* SIDEBAR */
+    .sidebar {
+      background: var(--surface);
+      border-right: 1px solid var(--border);
+      padding: 20px 0;
+    }
+    .nav-section { padding: 6px 16px 4px; font-size: 10px; color: var(--muted); letter-spacing: 1.5px; }
+    .nav-item {
+      display: flex; align-items: center; gap: 10px;
+      padding: 9px 20px; cursor: pointer;
+      color: var(--muted); font-size: 12px;
+      border-left: 2px solid transparent;
+      transition: all 0.15s;
+    }
+    .nav-item:hover, .nav-item.active {
+      color: var(--text);
+      background: rgba(0,212,255,0.05);
+      border-left-color: var(--accent);
+    }
+    .nav-item.active { color: var(--accent); }
+    .nav-icon { font-size: 14px; width: 18px; }
+    .nav-badge {
+      margin-left: auto; background: var(--danger);
+      color: #fff; font-size: 10px; padding: 1px 6px; border-radius: 10px;
+    }
+    .threat-level {
+      margin: 16px; padding: 12px;
+      border: 1px solid rgba(239,68,68,0.3);
+      border-radius: 6px;
+      background: rgba(239,68,68,0.05);
+    }
+    .tl-label { font-size: 10px; color: var(--muted); letter-spacing: 1px; margin-bottom: 6px; }
+    .tl-value { font-size: 18px; font-weight: 700; color: var(--danger); }
+    .tl-bar {
+      height: 4px; background: var(--border); border-radius: 2px; margin-top: 8px;
+    }
+    .tl-fill { height: 4px; background: var(--danger); border-radius: 2px; width: 72%; }
+    /* CONTENT */
+    .content { padding: 20px; overflow-y: auto; }
+    /* KPI CARDS */
+    .kpi-grid { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; margin-bottom: 20px; }
+    .kpi-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px;
+      position: relative; overflow: hidden;
+    }
+    .kpi-card::before {
+      content:''; position: absolute; top:0; left:0; right:0; height:2px;
+    }
+    .kpi-card.danger::before { background: var(--danger); }
+    .kpi-card.warning::before { background: var(--warning); }
+    .kpi-card.success::before { background: var(--success); }
+    .kpi-card.info::before { background: var(--accent); }
+    .kpi-label { font-size: 10px; color: var(--muted); letter-spacing: 1px; margin-bottom: 8px; }
+    .kpi-value { font-size: 28px; font-weight: 700; line-height: 1; }
+    .kpi-sub { font-size: 10px; margin-top: 6px; }
+    .kpi-sub.up { color: var(--danger); }
+    .kpi-sub.down { color: var(--success); }
+    /* CHART ROW */
+    .chart-row { display: grid; grid-template-columns: 1fr 1fr 340px; gap: 12px; margin-bottom: 20px; }
+    .panel {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px; padding: 16px;
+    }
+    .panel-title {
+      font-size: 11px; letter-spacing: 1.5px; color: var(--accent);
+      margin-bottom: 12px; text-transform: uppercase;
+      display: flex; align-items: center; justify-content: space-between;
+    }
+    .panel-title span { color: var(--muted); font-size: 10px; }
+    .chart-wrap { position: relative; height: 180px; }
+    /* FEED */
+    .feed-row { display: grid; grid-template-columns: 1fr 380px; gap: 12px; margin-bottom: 20px; }
+    .alert-item {
+      display: flex; align-items: flex-start; gap: 10px;
+      padding: 10px 0; border-bottom: 1px solid var(--border);
+    }
+    .alert-item:last-child { border-bottom: none; }
+    .sev-badge {
+      font-size: 9px; padding: 2px 6px; border-radius: 3px;
+      font-weight: 700; letter-spacing: 0.5px; white-space: nowrap;
+    }
+    .sev-CRIT { background: rgba(239,68,68,0.2); color: #fca5a5; border: 1px solid rgba(239,68,68,0.4); }
+    .sev-HIGH { background: rgba(245,158,11,0.2); color: #fcd34d; border: 1px solid rgba(245,158,11,0.4); }
+    .sev-MED  { background: rgba(0,212,255,0.1); color: var(--accent); border: 1px solid rgba(0,212,255,0.3); }
+    .sev-LOW  { background: rgba(16,185,129,0.1); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.3); }
+    .alert-body { flex: 1; }
+    .alert-title { font-size: 12px; color: var(--text); margin-bottom: 3px; }
+    .alert-meta { font-size: 10px; color: var(--muted); }
+    .alert-time { font-size: 10px; color: var(--muted); white-space: nowrap; }
+    /* MAP */
+    .geo-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    .world-map {
+      position: relative; height: 200px;
+      background: var(--surface2);
+      border-radius: 6px; overflow: hidden;
+      display: flex; align-items: center; justify-content: center;
+    }
+    .map-grid {
+      position: absolute; inset:0;
+      background-image:
+        linear-gradient(rgba(0,212,255,0.04) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(0,212,255,0.04) 1px, transparent 1px);
+      background-size: 20px 20px;
+    }
+    .ip-dot {
+      position: absolute; width: 8px; height: 8px;
+      border-radius: 50%;
+      animation: geoRing 2s infinite;
+    }
+    .ip-dot::after {
+      content:''; position: absolute;
+      inset: -4px; border-radius: 50%;
+      border: 1px solid currentColor; opacity: 0.3;
+      animation: ringExpand 2s infinite;
+    }
+    @keyframes geoRing { 0%,100%{opacity:1} 50%{opacity:0.6} }
+    @keyframes ringExpand { 0%{transform:scale(1);opacity:0.4} 100%{transform:scale(2);opacity:0} }
+    .country-row {
+      display: flex; align-items: center; gap: 8px;
+      padding: 6px 0; border-bottom: 1px solid var(--border);
+    }
+    .country-row:last-child { border-bottom: none; }
+    .country-flag { font-size: 16px; width: 22px; }
+    .country-name { flex: 1; font-size: 11px; }
+    .country-bar { flex: 2; height: 4px; background: var(--border); border-radius: 2px; }
+    .country-fill { height: 4px; border-radius: 2px; background: var(--danger); }
+    .country-count { font-size: 11px; color: var(--muted); min-width: 30px; text-align: right; }
+    /* IOC TABLE */
+    .table-panel { background: var(--surface); border: 1px solid var(--border); border-radius: 8px; padding: 16px; }
+    table { width: 100%; border-collapse: collapse; }
+    thead th {
+      font-size: 10px; letter-spacing: 1px; color: var(--muted);
+      padding: 6px 10px; text-align: left;
+      border-bottom: 1px solid var(--border);
+    }
+    tbody tr {
+      border-bottom: 1px solid var(--border);
+      cursor: pointer; transition: background 0.1s;
+    }
+    tbody tr:last-child { border-bottom: none; }
+    tbody tr:hover { background: rgba(0,212,255,0.03); }
+    td { padding: 8px 10px; font-size: 11px; }
+    .ioc-type {
+      font-size: 9px; padding: 2px 6px; border-radius: 3px;
+      background: rgba(124,58,237,0.15); color: #c4b5fd;
+      border: 1px solid rgba(124,58,237,0.3);
+    }
+    .ioc-val { color: var(--accent); font-family: monospace; font-size: 11px; }
+    .status-badge {
+      font-size: 9px; padding: 2px 6px; border-radius: 3px; font-weight:700;
+    }
+    .status-active { background: rgba(239,68,68,0.15); color: #fca5a5; border: 1px solid rgba(239,68,68,0.3); }
+    .status-blocked { background: rgba(16,185,129,0.1); color: #6ee7b7; border: 1px solid rgba(16,185,129,0.3); }
+    .status-monitor { background: rgba(245,158,11,0.1); color: #fcd34d; border: 1px solid rgba(245,158,11,0.3); }
+    /* MITRE */
+    .mitre-grid { display: flex; flex-wrap: wrap; gap: 4px; }
+    .mitre-tactic {
+      background: var(--surface2); border: 1px solid var(--border);
+      border-radius: 4px; padding: 6px 8px;
+    }
+    .mitre-name { font-size: 9px; color: var(--muted); letter-spacing: 0.5px; margin-bottom: 4px; }
+    .mitre-techniques { display: flex; flex-wrap: wrap; gap: 3px; }
+    .mitre-tech {
+      font-size: 9px; padding: 2px 5px; border-radius: 2px;
+      background: rgba(0,212,255,0.1); color: var(--accent);
+      border: 1px solid rgba(0,212,255,0.2);
+    }
+    .mitre-tech.hit { background: rgba(239,68,68,0.15); color: #fca5a5; border-color: rgba(239,68,68,0.3); }
+    /* MISC */
+    .filter-bar { display: flex; gap: 8px; margin-bottom: 12px; flex-wrap: wrap; }
+    .filter-btn {
+      font-size: 10px; padding: 4px 10px; border-radius: 4px;
+      background: transparent; border: 1px solid var(--border);
+      color: var(--muted); cursor: pointer; font-family: var(--font);
+      transition: all 0.15s;
+    }
+    .filter-btn.active, .filter-btn:hover {
+      border-color: var(--accent); color: var(--accent);
+      background: rgba(0,212,255,0.05);
+    }
+    .search-box {
+      margin-left: auto; background: var(--surface2);
+      border: 1px solid var(--border); border-radius: 4px;
+      padding: 4px 10px; color: var(--text); font-family: var(--font);
+      font-size: 11px; width: 180px;
+    }
+    .search-box::placeholder { color: var(--muted); }
+    .section-hdr { display: flex; align-items: center; gap: 8px; margin-bottom: 12px; }
+    .section-title { font-size: 11px; letter-spacing: 1.5px; color: var(--accent); text-transform: uppercase; }
+    .section-line { flex: 1; height: 1px; background: var(--border); }
+  </style>
+</head>
+<body>
+
+<header class="header">
+  <div class="logo">
+    <div class="logo-icon">🛡</div>
+    <div>
+      <div class="logo-text">SIEM·SOC</div>
+      <div class="logo-sub">THREAT INTELLIGENCE PLATFORM v2.4.1</div>
+    </div>
+  </div>
+  <div class="header-right">
+    <div class="live-badge"><div class="live-dot"></div> LIVE MONITORING</div>
+    <div class="time" id="clock">--:--:-- UTC</div>
+  </div>
+</header>
+
+<div class="main">
+  <!-- SIDEBAR -->
+  <aside class="sidebar">
+    <div class="threat-level">
+      <div class="tl-label">THREAT LEVEL</div>
+      <div class="tl-value">HIGH</div>
+      <div class="tl-bar"><div class="tl-fill"></div></div>
+    </div>
+    <div class="nav-section">MONITORING</div>
+    <div class="nav-item active"><span class="nav-icon">📊</span> Overview <span class="nav-badge">12</span></div>
+    <div class="nav-item"><span class="nav-icon">🚨</span> Alerts</div>
+    <div class="nav-item"><span class="nav-icon">🌐</span> Network Events</div>
+    <div class="nav-item"><span class="nav-icon">🔍</span> Threat Intel</div>
+    <div class="nav-section">INVESTIGATION</div>
+    <div class="nav-item"><span class="nav-icon">🔬</span> IOC Analysis</div>
+    <div class="nav-item"><span class="nav-icon">🗺</span> MITRE ATT&CK</div>
+    <div class="nav-item"><span class="nav-icon">📁</span> Cases <span class="nav-badge">3</span></div>
+    <div class="nav-section">REPORTS</div>
+    <div class="nav-item"><span class="nav-icon">📝</span> Incident Reports</div>
+    <div class="nav-item"><span class="nav-icon">📈</span> Analytics</div>
+    <div class="nav-section">ADMIN</div>
+    <div class="nav-item"><span class="nav-icon">⚙</span> SIEM Rules</div>
+    <div class="nav-item"><span class="nav-icon">👤</span> Analyst Profile</div>
+  </aside>
+
+  <!-- MAIN CONTENT -->
+  <div class="content">
+
+    <!-- KPI -->
+    <div class="kpi-grid">
+      <div class="kpi-card danger">
+        <div class="kpi-label">CRITICAL ALERTS</div>
+        <div class="kpi-value" style="color:var(--danger)" id="crit-count">7</div>
+        <div class="kpi-sub up">▲ 3 from last hour</div>
+      </div>
+      <div class="kpi-card warning">
+        <div class="kpi-label">TOTAL EVENTS / HR</div>
+        <div class="kpi-value" style="color:var(--warning)" id="event-count">24,831</div>
+        <div class="kpi-sub up">▲ 18% anomaly</div>
+      </div>
+      <div class="kpi-card info">
+        <div class="kpi-label">BLOCKED IOCs</div>
+        <div class="kpi-value" style="color:var(--accent)" id="ioc-count">1,249</div>
+        <div class="kpi-sub down">▼ threat contained</div>
+      </div>
+      <div class="kpi-card success">
+        <div class="kpi-label">MEAN TIME TO DETECT</div>
+        <div class="kpi-value" style="color:var(--success)">4.2<span style="font-size:14px">min</span></div>
+        <div class="kpi-sub down">▼ 12% improvement</div>
+      </div>
+    </div>
+
+    <!-- CHARTS ROW -->
+    <div class="chart-row">
+      <div class="panel">
+        <div class="panel-title">EVENTS TIMELINE <span>LAST 24H</span></div>
+        <div class="chart-wrap"><canvas id="eventsChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">ALERT DISTRIBUTION <span>BY SEVERITY</span></div>
+        <div class="chart-wrap"><canvas id="severityChart"></canvas></div>
+      </div>
+      <div class="panel">
+        <div class="panel-title">TOP ATTACK TYPES</div>
+        <div id="attackTypes"></div>
+      </div>
+    </div>
+
+    <!-- FEED + GEO -->
+    <div class="feed-row">
+      <!-- ALERT FEED -->
+      <div class="panel">
+        <div class="panel-title">LIVE ALERT FEED <span id="alert-ticker">● STREAMING</span></div>
+        <div class="filter-bar">
+          <button class="filter-btn active">ALL</button>
+          <button class="filter-btn">CRITICAL</button>
+          <button class="filter-btn">HIGH</button>
+          <button class="filter-btn">MEDIUM</button>
+          <input class="search-box" placeholder="⌕  search alerts..." />
+        </div>
+        <div id="alertFeed"></div>
+      </div>
+      <!-- GEO -->
+      <div>
+        <div class="panel" style="margin-bottom:12px">
+          <div class="panel-title">ATTACK ORIGIN GEO <span>LIVE</span></div>
+          <div class="world-map">
+            <div class="map-grid"></div>
+            <svg viewBox="0 0 500 250" style="width:100%;opacity:0.4;position:absolute;">
+              <text x="250" y="130" text-anchor="middle" fill="#00d4ff" font-size="80" opacity="0.06">WORLD</text>
+            </svg>
+            <div class="ip-dot" style="background:#ef4444;color:#ef4444;left:15%;top:35%"></div>
+            <div class="ip-dot" style="background:#ef4444;color:#ef4444;left:68%;top:25%;animation-delay:0.5s"></div>
+            <div class="ip-dot" style="background:#f59e0b;color:#f59e0b;left:80%;top:40%;animation-delay:1s"></div>
+            <div class="ip-dot" style="background:#ef4444;color:#ef4444;left:50%;top:30%;animation-delay:0.2s"></div>
+            <div class="ip-dot" style="background:#f59e0b;color:#f59e0b;left:25%;top:55%;animation-delay:0.8s"></div>
+            <div style="position:absolute;top:8px;right:8px;font-size:9px;color:var(--muted)">● CRITICAL &nbsp; ● HIGH</div>
+          </div>
+          <div style="margin-top:10px">
+            <div class="country-row"><span class="country-flag">🇨🇳</span><span class="country-name">China</span><div class="country-bar"><div class="country-fill" style="width:85%"></div></div><span class="country-count">342</span></div>
+            <div class="country-row"><span class="country-flag">🇷🇺</span><span class="country-name">Russia</span><div class="country-bar"><div class="country-fill" style="width:68%"></div></div><span class="country-count">271</span></div>
+            <div class="country-row"><span class="country-flag">🇰🇵</span><span class="country-name">North Korea</span><div class="country-bar"><div class="country-fill" style="width:42%"></div></div><span class="country-count">167</span></div>
+            <div class="country-row"><span class="country-flag">🇮🇷</span><span class="country-name">Iran</span><div class="country-bar"><div class="country-fill" style="width:31%"></div></div><span class="country-count">124</span></div>
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- IOC TABLE -->
+    <div class="section-hdr"><div class="section-title">INDICATORS OF COMPROMISE</div><div class="section-line"></div></div>
+    <div class="table-panel" style="margin-bottom:20px">
+      <div class="filter-bar">
+        <button class="filter-btn active">ALL IOCs</button>
+        <button class="filter-btn">IP ADDRESS</button>
+        <button class="filter-btn">DOMAIN</button>
+        <button class="filter-btn">FILE HASH</button>
+        <button class="filter-btn">URL</button>
+        <input class="search-box" placeholder="⌕  search IOCs..." />
+      </div>
+      <table>
+        <thead>
+          <tr>
+            <th>TYPE</th><th>INDICATOR</th><th>THREAT ACTOR</th>
+            <th>CONFIDENCE</th><th>FIRST SEEN</th><th>STATUS</th>
+          </tr>
+        </thead>
+        <tbody id="iocTable"></tbody>
+      </table>
+    </div>
+
+    <!-- MITRE -->
+    <div class="section-hdr"><div class="section-title">MITRE ATT&CK COVERAGE</div><div class="section-line"></div></div>
+    <div class="panel" style="margin-bottom:20px">
+      <div class="mitre-grid" id="mitreGrid"></div>
+    </div>
+
+  </div>
+</div>
+
+<script>
+// Clock
+function updateClock(){
+  const now = new Date();
+  document.getElementById('clock').textContent =
+    now.toUTCString().split(' ').slice(4,5)[0] + ' UTC';
+}
+setInterval(updateClock, 1000); updateClock();
+
+// Events Chart
+const evCtx = document.getElementById('eventsChart').getContext('2d');
+const hours = Array.from({length:24},(_,i)=>`${String(i).padStart(2,'0')}:00`);
+const evData = [1200,980,850,760,900,1100,2400,4200,5800,6200,5100,4800,
+                5200,5600,4900,5100,6800,7200,8100,6500,4200,3100,2400,1800];
+new Chart(evCtx, {
+  type:'line',
+  data:{
+    labels:hours,
+    datasets:[{
+      label:'Events/hr',
+      data:evData,
+      borderColor:'#00d4ff',
+      backgroundColor:'rgba(0,212,255,0.08)',
+      borderWidth:1.5,
+      pointRadius:0,
+      fill:true,
+      tension:0.4
+    },{
+      label:'Anomaly',
+      data:evData.map(v=>v>5500?v:null),
+      borderColor:'#ef4444',
+      backgroundColor:'rgba(239,68,68,0.1)',
+      borderWidth:1,
+      pointRadius:0,
+      fill:true,
+      tension:0.4
+    }]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{legend:{display:false}},
+    scales:{
+      x:{ticks:{color:'#64748b',font:{size:9},maxTicksLimit:8},grid:{color:'rgba(255,255,255,0.03)'}},
+      y:{ticks:{color:'#64748b',font:{size:9}},grid:{color:'rgba(255,255,255,0.03)'}}
+    }
+  }
+});
+
+// Severity Chart
+const sevCtx = document.getElementById('severityChart').getContext('2d');
+new Chart(sevCtx, {
+  type:'doughnut',
+  data:{
+    labels:['Critical','High','Medium','Low'],
+    datasets:[{
+      data:[7,23,45,89],
+      backgroundColor:['#ef4444','#f59e0b','#00d4ff','#10b981'],
+      borderWidth:0, hoverOffset:4
+    }]
+  },
+  options:{
+    responsive:true, maintainAspectRatio:false,
+    plugins:{
+      legend:{
+        position:'right',
+        labels:{color:'#e2e8f0',font:{size:10},padding:10,boxWidth:10}
+      }
+    }
+  }
+});
+
+// Attack types
+const attacks = [
+  {name:'Brute Force SSH',count:342,pct:85,color:'#ef4444'},
+  {name:'SQL Injection',count:187,pct:47,color:'#f59e0b'},
+  {name:'Phishing',count:156,pct:39,color:'#7c3aed'},
+  {name:'C2 Beaconing',count:89,pct:22,color:'#ef4444'},
+  {name:'Data Exfil',count:34,pct:9,color:'#f59e0b'},
+];
+document.getElementById('attackTypes').innerHTML = attacks.map(a=>`
+  <div style="margin-bottom:10px">
+    <div style="display:flex;justify-content:space-between;font-size:10px;margin-bottom:3px">
+      <span>${a.name}</span><span style="color:${a.color}">${a.count}</span>
+    </div>
+    <div style="height:3px;background:#1e2d4a;border-radius:2px">
+      <div style="height:3px;border-radius:2px;background:${a.color};width:${a.pct}%;transition:width 1s ease"></div>
+    </div>
+  </div>`).join('');
+
+// Alert Feed
+const alerts = [
+  {sev:'CRIT',title:'Ransomware C2 Beacon Detected',meta:'Host: WKSTN-042 | 192.168.1.42 → 185.220.101.47',time:'00:02'},
+  {sev:'CRIT',title:'Admin Account Privilege Escalation',meta:'User: svc_backup | AD Domain Controller',time:'00:05'},
+  {sev:'HIGH',title:'Large Data Transfer to External IP',meta:'456MB → 45.33.32.156 | Port 443 encrypted',time:'00:11'},
+  {sev:'HIGH',title:'Lateral Movement via SMB',meta:'192.168.1.42 → 192.168.1.0/24 SCAN',time:'00:15'},
+  {sev:'HIGH',title:'Mimikatz Execution Detected',meta:'Process: powershell.exe | EDR Alert',time:'00:18'},
+  {sev:'MED',title:'Multiple Failed SSH Logins',meta:'Source: 218.92.0.31 | 847 attempts/min',time:'00:23'},
+  {sev:'MED',title:'Suspicious DNS Query Pattern',meta:'Domain: update-cdn-service[.]ru | 127 queries',time:'00:31'},
+  {sev:'LOW',title:'Port Scan Detected',meta:'Source: 10.0.0.47 | Nmap signature',time:'00:44'},
+];
+document.getElementById('alertFeed').innerHTML = alerts.map(a=>`
+  <div class="alert-item">
+    <span class="sev-badge sev-${a.sev}">${a.sev}</span>
+    <div class="alert-body">
+      <div class="alert-title">${a.title}</div>
+      <div class="alert-meta">${a.meta}</div>
+    </div>
+    <span class="alert-time">${a.time}m</span>
+  </div>`).join('');
+
+// IOC Table
+const iocs = [
+  {type:'IP',val:'185.220.101.47',actor:'APT28 (Fancy Bear)',conf:95,seen:'2024-01-15',status:'active'},
+  {type:'DOMAIN',val:'update-cdn-service[.]ru',actor:'APT28 (Fancy Bear)',conf:92,seen:'2024-01-14',status:'blocked'},
+  {type:'SHA256',val:'a7f3d9...c4b21e',actor:'Lazarus Group',conf:88,seen:'2024-01-13',status:'active'},
+  {type:'IP',val:'45.33.32.156',actor:'Unknown',conf:71,seen:'2024-01-12',status:'monitor'},
+  {type:'URL',val:'hxxps://malware[.]biz/payload',actor:'FIN7',conf:99,seen:'2024-01-10',status:'blocked'},
+  {type:'IP',val:'218.92.0.31',actor:'Turla Group',conf:83,seen:'2024-01-09',status:'blocked'},
+];
+document.getElementById('iocTable').innerHTML = iocs.map(i=>`
+  <tr>
+    <td><span class="ioc-type">${i.type}</span></td>
+    <td><span class="ioc-val">${i.val}</span></td>
+    <td style="color:var(--muted)">${i.actor}</td>
+    <td>
+      <div style="display:flex;align-items:center;gap:6px">
+        <div style="width:40px;height:3px;background:#1e2d4a;border-radius:2px">
+          <div style="height:3px;border-radius:2px;width:${i.conf}%;background:${i.conf>90?'#ef4444':i.conf>75?'#f59e0b':'#10b981'}"></div>
+        </div>
+        <span style="font-size:10px;color:var(--muted)">${i.conf}%</span>
+      </div>
+    </td>
+    <td style="color:var(--muted)">${i.seen}</td>
+    <td><span class="status-badge status-${i.status}">${i.status.toUpperCase()}</span></td>
+  </tr>`).join('');
+
+// MITRE ATT&CK
+const tactics = [
+  {name:'INITIAL ACCESS',techs:['T1566','T1190','T1133'],hits:['T1566']},
+  {name:'EXECUTION',techs:['T1059','T1203','T1569'],hits:['T1059','T1203']},
+  {name:'PERSISTENCE',techs:['T1078','T1053','T1543'],hits:[]},
+  {name:'PRIV ESC',techs:['T1055','T1068','T1134'],hits:['T1134']},
+  {name:'DEFENSE EVASION',techs:['T1036','T1112','T1562'],hits:['T1562']},
+  {name:'CREDENTIAL ACCESS',techs:['T1003','T1110','T1555'],hits:['T1003','T1110']},
+  {name:'DISCOVERY',techs:['T1082','T1083','T1046'],hits:['T1046']},
+  {name:'LATERAL MOVE',techs:['T1021','T1080','T1563'],hits:['T1021']},
+  {name:'COLLECTION',techs:['T1114','T1005','T1039'],hits:[]},
+  {name:'EXFILTRATION',techs:['T1041','T1048','T1071'],hits:['T1048']},
+];
+document.getElementById('mitreGrid').innerHTML = tactics.map(t=>`
+  <div class="mitre-tactic">
+    <div class="mitre-name">${t.name}</div>
+    <div class="mitre-techniques">
+      ${t.techs.map(tc=>`<span class="mitre-tech${t.hits.includes(tc)?' hit':''}">${tc}</span>`).join('')}
+    </div>
+  </div>`).join('');
+
+// Animate KPIs
+function animateNum(el,target,prefix=''){
+  let cur=0; const step=target/40;
+  const t=setInterval(()=>{
+    cur=Math.min(cur+step,target);
+    el.innerHTML=prefix+Math.round(cur).toLocaleString();
+    if(cur>=target)clearInterval(t);
+  },20);
+}
+
+// Filter buttons
+document.querySelectorAll('.filter-btn').forEach(btn=>{
+  btn.addEventListener('click',function(){
+    this.closest('.filter-bar').querySelectorAll('.filter-btn').forEach(b=>b.classList.remove('active'));
+    this.classList.add('active');
+  });
+});
+
+// Live blinking
+setInterval(()=>{
+  const el=document.getElementById('alert-ticker');
+  el.style.opacity=el.style.opacity==='0.3'?'1':'0.3';
+  // Simulate live event count
+  const ec=document.getElementById('event-count');
+  const base=24831;
+  const variation=Math.floor(Math.random()*500-250);
+  ec.textContent=(base+variation).toLocaleString();
+},1500);
+</script>
+</body>
+</html>
